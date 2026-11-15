@@ -1,5 +1,6 @@
-streamlit
-numpy
-pillow
-scipy
-  
+streamlit>=1.36
+opencv-python-headless>=4.9
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+matplotlib>=3.8
