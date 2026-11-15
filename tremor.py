@@ -312,8 +312,6 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
     ref = find_reference_dot(gray, pmask, pitch)
     if ref is None:
         ref_source = "mean"
-        warnings.append("기준점(검은 점)을 찾지 못해 레이저 평균 위치를 기준으로 사용했습니다. "
-                        "떨림 주파수·세기에는 영향이 없고, 조준 오차만 계산되지 않습니다.")
         ref_xy = seg.mean(0)
     else:
         ref_source = "dot"
