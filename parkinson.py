@@ -40,18 +40,27 @@ def _save_temp(data: bytes, name: str) -> str:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def cached_scan(file_hash: str, path: str, _progress_cb=None):
-    # file_hash 로 캐시 (밑줄로 시작하는 인자는 해시에서 제외됨)
-    return tremor.scan_video(path, progress_cb=_progress_cb)
+def cached_scan(file_hash: str, path: str, label: str):
+    """같은 파일은 다시 디코딩하지 않도록 session_state에 스캔 결과 저장.
+    (st.cache_data 안에서 진행률 표시줄을 갱신하면 Streamlit 오류가 나므로 직접 캐시)"""
+    cache = st.session_state.setdefault("scan_cache", {})
+    if file_hash in cache:
+        return cache[file_hash]
+    bar = st.progress(0.0, text=f"{label} 영상 프레임 분석 중…")
+    scan = tremor.scan_video(
+        path, progress_cb=lambda p: bar.progress(p, text=f"{label} 영상 프레임 분석 중… {p * 100:.0f}%"))
+    bar.empty()
+    if len(cache) >= 4:              # 메모리 보호: 오래된 것부터 삭제
+        cache.pop(next(iter(cache)))
+    cache[file_hash] = scan
+    return scan
 
 
 def run_analysis(upload, settings, onset_override, label):
     data = upload.getvalue()
     h = hashlib.md5(data).hexdigest()
     path = _save_temp(data, upload.name)
-    bar = st.progress(0.0, text=f"{label} 영상 프레임 분석 중…")
-    scan = cached_scan(h, path, lambda p: bar.progress(p, text=f"{label} 영상 프레임 분석 중… {p * 100:.0f}%"))
-    bar.empty()
+    scan = cached_scan(h, path, label)
     res = tremor.analyze_video(
         path, window_s=settings["window_s"], start_offset_s=settings["offset_s"],
         grid_mm=settings["grid_mm"], distance_cm=settings["distance_cm"] or None,
