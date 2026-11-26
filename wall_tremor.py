@@ -203,8 +203,10 @@ class TremorResult:
     drop_mm: float | None = None          # 처음 위치와 이완 위치의 세로 차이 (아래 +)
     height_used_cm: float = 0.0           # 각도 계산에 쓴 높이 차이
     height_source: str = "manual"         # 'auto'(하강으로 자동 계산) | 'manual'
-    elev_angle_deg: float | None = None   # 레이저가 아래로 기운 각도 = atan(하강 / 수평거리)
-    slant_cm: float | None = None         # 손~이완 위치 경사 거리 = sqrt(D^2 + 하강^2)
+    offset_x_mm: float | None = None      # 처음 위치 -> 이완 위치 가로 이동 (오른쪽 +)
+    shift_mm: float | None = None         # 처음 위치 -> 이완 위치 직선 거리 (노란 X -> 주황 +)
+    rot_angle_deg: float | None = None    # 처음 레이저 방향과 이완 후 방향 사이 각도 = atan(직선거리 / D)
+    slant_cm: float | None = None         # 손~이완 위치 실제 레이저 길이 = sqrt(D^2 + 직선거리^2)
     # 시계열 (그래프용)
     t: np.ndarray = field(repr=False, default=None)
     x_mm: np.ndarray = field(repr=False, default=None)
@@ -405,21 +407,27 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
     t = (np.arange(win0, win1) - onset) / fps
     x = (seg[:, 0] - ref_xy[0]) / ppm_x
     y = -(seg[:, 1] - ref_xy[1]) / ppm_y        # 위쪽 +
-    drop_mm = None
+    drop_mm = offx = shift = None
     h_used, h_src = (height_cm or 0.0), "manual"
+    offset = (0.0, -10.0 * h_used)                       # 직접 입력: 세로 방향만
     if desc is not None:
         final_xy = seg.mean(0)
-        drop_mm = float((final_xy[1] - desc["init_xy"][1]) / ppm_y)   # 화면 아래 = +
+        offx = float((final_xy[0] - desc["init_xy"][0]) / ppm_x)        # 오른쪽 +
+        drop_mm = float((final_xy[1] - desc["init_xy"][1]) / ppm_y)    # 아래 +
+        shift = float(np.hypot(offx, drop_mm))
+        offset = (offx, -drop_mm)
         h_used, h_src = drop_mm / 10.0, "auto"
         if desc["init_n"] < int(0.3 * fps):
             warnings.append("처음 수평 위치를 유지한 시간이 짧아(0.3 s 미만) 시작 위치 대표값이 부정확할 수 있습니다.")
     elif height_mode == "auto":
         h_used, h_src = 0.0, "auto"   # 하강 없음 = 처음부터 수평으로 겨눈 상태 (예: 수축 조건)
-    elev = slant = None
+        offset = (0.0, 0.0)
+    rot = slant = None
     if distance_cm:
-        elev = float(np.degrees(np.arctan2(abs(h_used), distance_cm)))
-        slant = float(np.hypot(distance_cm, h_used))
-    feats = compute_features(x, y, fps, distance_cm, h_used)
+        r_mm = float(np.hypot(*offset))
+        rot = float(np.degrees(np.arctan2(r_mm, distance_cm * 10.0)))
+        slant = float(np.hypot(distance_cm * 10.0, r_mm) / 10.0)
+    feats = compute_features(x, y, fps, distance_cm, offset)
 
     # ---- 미리보기 이미지 (배경 + 검출된 선 + 궤적 + 기준점) ----
     prev = bg.copy()
@@ -438,9 +446,9 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
     if desc is not None:
         p0 = (int(desc["init_xy"][0]), int(desc["init_xy"][1]))
         p1 = (int(seg[:, 0].mean()), int(seg[:, 1].mean()))
-        cv2.line(prev, p0, (p0[0], p1[1]), (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(prev, p0, p1, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.drawMarker(prev, p0, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
-        cv2.putText(prev, f"drop {drop_mm:.0f} mm", (p0[0] + 12, (p0[1] + p1[1]) // 2),
+        cv2.putText(prev, f"{shift:.0f} mm", ((p0[0] + p1[0]) // 2 + 12, (p0[1] + p1[1]) // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
     return TremorResult(
@@ -452,7 +460,8 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
         mean_offset_mm=None,
         descent=desc is not None, move_s=(desc["move_idx"] / fps) if desc else None,
         arrive_s=(desc["arrive_idx"] / fps) if desc else None, drop_mm=drop_mm,
-        height_used_cm=float(h_used), height_source=h_src, elev_angle_deg=elev, slant_cm=slant,
+        height_used_cm=float(h_used), height_source=h_src, offset_x_mm=offx, shift_mm=shift,
+        rot_angle_deg=rot, slant_cm=slant,
         t=t, x_mm=x, y_mm=y, preview_bgr=prev, warnings=warnings, **feats)
 
 
@@ -461,23 +470,28 @@ def _band_power(f, P, band):
     return float(_trapz(P[m], f[m])) if m.sum() > 1 else 0.0
 
 
-def angle_scale(distance_cm, height_cm=0.0):
-    """종이 위 변위(mm) -> 손의 회전각(mrad) 환산 계수 (x, y).
-    distance_cm: 레이저에서 종이 벽까지의 수평(수직 입사) 거리 D
-    height_cm  : 레이저 높이와 표적 높이의 차이 h (부호 무관)
-      경사 거리 L = sqrt(D^2 + h^2), 앙각 θ = atan(h / D)
-      가로: dx = L·dα          -> dα = dx / L
-      세로: dy = L·dα / cosθ   -> dα = dy·cosθ / L  (비스듬히 맞아 세로로 늘어남)"""
+def angle_matrix(distance_cm, offset_mm=(0.0, 0.0)):
+    """벽 위 변위(mm, x 오른쪽·y 위) -> 레이저(손)의 회전각(mrad) 변환 행렬 M (2x2).
+    distance_cm: 손에서 벽까지의 수직(최단) 거리 D  — 처음 수평 위치(노란 X)까지의 거리
+    offset_mm  : 처음 수평 위치(노란 X) -> 측정 위치(이완 위치)까지의 벽 위 변위 (ox, oy)
+      실제 레이저 길이 L = sqrt(D^2 + |o|^2),  입사각 φ = atan(|o| / D)
+      o 방향(반지름 방향) 변위는 비스듬히 맞아 1/cosφ 만큼 늘어나 보이고,
+      그와 수직인 방향 변위는 그대로 -> 회전각 = M·d,  M = (cosφ·u uᵀ + v vᵀ) / L"""
     if not distance_cm:
         return None
     D = distance_cm * 10.0
-    h = (height_cm or 0.0) * 10.0
-    L = float(np.hypot(D, h))
-    cos_t = D / L
-    return 1000.0 / L, 1000.0 * cos_t / L
+    o = np.asarray(offset_mm, float)
+    r = float(np.hypot(*o))
+    L = float(np.hypot(D, r))
+    if r < 1e-6:
+        return np.eye(2) * 1000.0 / L
+    u = o / r
+    v = np.array([-u[1], u[0]])
+    cos_p = D / L
+    return 1000.0 * (cos_p * np.outer(u, u) + np.outer(v, v)) / L
 
 
-def compute_features(x, y, fps, distance_cm=None, height_cm=0.0) -> dict:
+def compute_features(x, y, fps, distance_cm=None, offset_mm=(0.0, 0.0)) -> dict:
     nyq = fps / 2
     hi = min(TREMOR_BAND[1], nyq * 0.9)
     b, a = signal.butter(3, [TREMOR_BAND[0], hi], btype="band", fs=fps)
@@ -505,13 +519,15 @@ def compute_features(x, y, fps, distance_cm=None, height_cm=0.0) -> dict:
     pk_rms = float(np.sqrt(_band_power(f, P, (fpk - 1.0, fpk + 1.0))))
     pk_ratio = _band_power(f, P, (fpk - 1.0, fpk + 1.0)) / tot
 
-    # 각도(mrad) 환산: 가로·세로에 서로 다른 계수 적용
-    sc = angle_scale(distance_cm, height_cm)
-    if sc:
-        kx, ky = sc
-        rms_mrad = float(np.sqrt(np.mean((kx * xf) ** 2 + (ky * yf) ** 2)))
-        pk_mrad = float(np.sqrt(kx ** 2 * _band_power(f, Px, (fpk - 1.0, fpk + 1.0))
-                                + ky ** 2 * _band_power(f, Py, (fpk - 1.0, fpk + 1.0))))
+    # 각도(mrad) 환산: 처음 수평 위치 -> 측정 위치 방향(비스듬한 방향)과 그 수직 방향을 따로 보정
+    M = angle_matrix(distance_cm, offset_mm)
+    if M is not None:
+        ax_, ay_ = M @ np.vstack([xf, yf])
+        rms_mrad = float(np.sqrt(np.mean(ax_ ** 2 + ay_ ** 2)))
+        axr, ayr = M @ np.vstack([signal.detrend(x), signal.detrend(y)])
+        _, Pax = signal.welch(axr, fs=fps, nperseg=nper, noverlap=nper // 2, nfft=4 * nper)
+        _, Pay = signal.welch(ayr, fs=fps, nperseg=nper, noverlap=nper // 2, nfft=4 * nper)
+        pk_mrad = float(np.sqrt(_band_power(f, Pax + Pay, (fpk - 1.0, fpk + 1.0))))
     else:
         rms_mrad = pk_mrad = None
 
