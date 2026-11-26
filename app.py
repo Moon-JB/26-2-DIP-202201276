@@ -190,11 +190,11 @@ with st.sidebar:
                                   help="길수록 정확합니다. 10 mm 표시는 오차가 수 % 생길 수 있어요.")
     else:
         manual_ppm = st.number_input("축척 (원본 영상 px / mm)", 0.1, 100.0, 4.5, 0.01)
-    distance_cm = st.number_input("레이저–종이 벽 수평 거리 (cm, 0 = 미입력)", 0.0, 2000.0, 426.0, 1.0,
+    distance_cm = st.number_input("손–벽 거리 (cm, 처음 수평 위치까지 / 0 = 미입력)", 0.0, 2000.0, 426.0, 1.0,
                                   help="입력하면 떨림을 각도(mrad)로 환산해 거리와 무관하게 비교합니다.")
     h_label = st.radio("높이 차이 (각도 보정)", ["자동: 처음 수평 위치 − 이완 위치", "직접 입력"],
-                       help="자동: 처음 수평으로 겨눈 레이저 위치와 팔을 이완해 내려온 위치의 세로 차이를 "
-                            "높이 차이로 보고, 수평 거리와 피타고라스로 각도를 계산합니다. "
+                       help="자동: 처음 수평으로 겨눈 레이저 위치(노란 X)에서 이완 위치까지의 직선 거리와 "
+                            "벽까지의 거리로 피타고라스·아크탄젠트를 써서 팔 회전 각도를 계산합니다. "
                             "하강이 없으면(수축 조건 등) 0 cm로 계산합니다.")
     height_mode = "auto" if h_label.startswith("자동") else "manual"
     height_cm = 0.0
@@ -203,7 +203,7 @@ with st.sidebar:
         if distance_cm:
             import math
             st.caption(f"경사 거리 {math.hypot(distance_cm, height_cm):.1f} cm · "
-                       f"앙각 {math.degrees(math.atan2(abs(height_cm), distance_cm)):.1f}°")
+                       f"기울기 {math.degrees(math.atan2(abs(height_cm), distance_cm)):.1f}°")
     else:
         st.caption("하강이 있으면 분석 구간은 '이완 위치 도착 후' 기준으로 잡힙니다.")
     with st.expander("판정 기준 (고급)"):
@@ -303,9 +303,10 @@ for tab, (k, res) in zip(tabs, results.items()):
         with b:
             show(fig_timeline(scans[k], res))
             if res.descent:
-                st.info(f"수평 → 이완 하강 {res.drop_mm:.1f} mm 검출 ({res.move_s:.2f}–{res.arrive_s:.2f}s) → 높이 차이 "
-                        f"{res.height_used_cm:.1f} cm" + (f", 앙각 {res.elev_angle_deg:.2f}°, 경사 거리 {res.slant_cm:.1f} cm"
-                                                           if res.elev_angle_deg is not None else ""))
+                st.info(f"처음 수평 위치(노란 X) → 이완 위치: 직선 {res.shift_mm:.1f} mm "
+                        f"(세로 {res.drop_mm:.1f} mm, 가로 {res.offset_x_mm:+.1f} mm, {res.move_s:.2f}–{res.arrive_s:.2f}s)"
+                        + (f" → 팔 회전 각도 {res.rot_angle_deg:.2f}°, 실제 레이저 길이 {res.slant_cm:.1f} cm"
+                           if res.rot_angle_deg is not None else ""))
             else:
                 st.caption(f"높이 차이 {res.height_used_cm:.1f} cm ({'하강 없음 → 수평' if res.height_source == 'auto' else '직접 입력'})")
             st.caption(f"레이저 발사 {res.onset_s:.2f}s → 분석 구간 {res.win_start_s:.2f}–{res.win_end_s:.2f}s · "
@@ -317,7 +318,7 @@ st.subheader("결과 내보내기")
 meta = {"name": name, "trial": trial}
 df = summary_rows(results, meta, verdict)
 st.dataframe(df[["조건", "peak_freq_hz", "peak_prominence_db", "peak_rms_mm", "peak_rms_mrad",
-                 "tremor_rms_mm", "tremor_rms_mrad", "drift_rms_mm", "ellipse95_area_mm2", "drop_mm", "height_used_cm", "elev_angle_deg", "onset_s"]],
+                 "tremor_rms_mm", "tremor_rms_mrad", "drift_rms_mm", "ellipse95_area_mm2", "shift_mm", "drop_mm", "offset_x_mm", "rot_angle_deg", "slant_cm", "onset_s"]],
              hide_index=True)
 fname = f"{name or 'subject'}_{trial}".replace(" ", "_")
 d1, d2 = st.columns(2)
