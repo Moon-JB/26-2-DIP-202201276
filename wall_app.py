@@ -1,6 +1,6 @@
 """
 [벽 실험용] 레이저 포인터 손떨림 분석기 (Streamlit) — wall_app.py
-모눈종이 대신 벽에 그은 10 cm 가로선·세로선으로 길이 축척을 정하는 버전
+모눈종이 대신 벽에 붙인 흰 종이의 검은 점 2개(10 cm 간격)로 길이 축척을 정하는 버전
 - 이완/수축 영상을 업로드하면 레이저 점을 추적해 떨림 주파수·세기를 계산하고
   정상 / 본태성 떨림(수전증) / 파킨슨병 패턴을 규칙 기반으로 판정합니다.
 - 연구·교육용 선별 도구이며 의학적 진단을 대신하지 않습니다.
@@ -70,7 +70,7 @@ def run_analysis(upload, settings, onset_override, label):
     res = tremor.analyze_video(
         path, window_s=settings["window_s"], start_offset_s=settings["offset_s"],
         distance_cm=settings["distance_cm"] or None, height_cm=settings["height_cm"], height_mode=settings["height_mode"],
-        line_h_mm=settings["line_h_mm"], line_v_mm=settings["line_v_mm"], scale_mode=settings["scale_mode"],
+        dot_mm=settings["dot_mm"], scale_mode=settings["scale_mode"],
         manual_ppm_x=settings["ppm_x"], manual_ppm_y=settings["ppm_y"],
         onset_override_s=onset_override, scan=scan)
     return res, scan
@@ -180,13 +180,12 @@ with st.sidebar:
     st.header("분석 설정")
     offset_s = st.number_input("레이저 발사 후 제외 시간 (s)", 0.0, 5.0, 1.0, 0.1)
     window_s = st.number_input("분석 구간 길이 (s)", 2.0, 30.0, 7.0, 0.5)
-    scale_label = st.radio("길이 기준 (축척)", ["벽의 가로·세로선 자동", "직접 입력 (px/mm)"],
+    scale_label = st.radio("길이 기준 (축척)", ["흰 종이의 검은 점 2개 자동", "직접 입력 (px/mm)"],
                            help="떨림 주파수는 축척과 무관합니다. 축척은 진폭(mm·mrad)에만 영향을 줍니다.")
-    scale_mode = "lines" if scale_label.startswith("벽") else "manual"
-    line_h_mm, line_v_mm, ppm_x, ppm_y = 100.0, 100.0, None, None
-    if scale_mode == "lines":
-        line_h_mm = st.number_input("가로선 실제 길이 (mm)", 10.0, 1000.0, 100.0, 1.0)
-        line_v_mm = st.number_input("세로선 실제 길이 (mm)", 10.0, 1000.0, 100.0, 1.0)
+    scale_mode = "dots" if scale_label.startswith("흰") else "manual"
+    dot_mm, ppm_x, ppm_y = 100.0, None, None
+    if scale_mode == "dots":
+        dot_mm = st.number_input("두 점 중심 사이 실제 거리 (mm)", 10.0, 1000.0, 100.0, 0.5)
     else:
         ppm_x = st.number_input("가로 축척 (원본 영상 px / mm)", 0.1, 100.0, 4.5, 0.01)
         ppm_y = st.number_input("세로 축척 (원본 영상 px / mm)", 0.1, 100.0, 4.5, 0.01)
@@ -216,7 +215,7 @@ with st.sidebar:
         st.caption("기본값은 문헌의 주파수 대역과 정상인 시험 데이터로 정한 잠정값입니다. "
                    "데이터가 쌓이면 조정하세요.")
 settings = dict(offset_s=offset_s, window_s=window_s, scale_mode=scale_mode,
-                line_h_mm=line_h_mm, line_v_mm=line_v_mm, ppm_x=ppm_x, ppm_y=ppm_y, distance_cm=distance_cm, height_cm=height_cm,
+                dot_mm=dot_mm, ppm_x=ppm_x, ppm_y=ppm_y, distance_cm=distance_cm, height_cm=height_cm,
                 height_mode=height_mode)
 criteria = tremor.Criteria(amp_thr=amp_thr, prom_thr_db=prom_thr, path_band=(band_lo, band_hi),
                            pd_max_freq=pd_max, rest_dominance=dom)
@@ -225,7 +224,7 @@ criteria = tremor.Criteria(amp_thr=amp_thr, prom_thr_db=prom_thr, path_band=(ban
 # 본문
 # ------------------------------------------------------------------------------------------
 st.title("🔴 레이저 손떨림 분석기 · 벽 실험")
-st.caption("벽에 그은 10 cm 가로선·세로선 근처를 레이저로 겨눈 영상을 이완·수축 조건별로 올리면 "
+st.caption("벽에 흰 종이(검은 점 2개, 10 cm 간격)를 붙이고 레이저로 벽을 겨눈 영상을 이완·수축 조건별로 올리면 "
            "떨림 주파수와 세기를 계산하고 떨림 패턴을 판정합니다. **연구·교육용 도구이며 진단을 대신하지 않습니다.**")
 
 c1, c2 = st.columns(2)
@@ -299,7 +298,7 @@ for tab, (k, res) in zip(tabs, results.items()):
         a, b = st.columns([1, 1.4])
         with a:
             st.image(cv2.cvtColor(res.preview_bgr, cv2.COLOR_BGR2RGB),
-                     caption="검출 결과: 보라=가로선, 파랑=세로선, 빨간선=레이저 궤적, 초록 +=선 교차점(주황 +=레이저 평균 위치)")
+                     caption="검출 결과: 하늘색=흰 종이, 보라 원=기준 점 2개, 빨간선=레이저 궤적, 주황 +=레이저 평균 위치, 노란 X=처음 수평 위치")
         with b:
             show(fig_timeline(scans[k], res))
             if res.descent:
@@ -309,7 +308,7 @@ for tab, (k, res) in zip(tabs, results.items()):
             else:
                 st.caption(f"높이 차이 {res.height_used_cm:.1f} cm ({'하강 없음 → 수평' if res.height_source == 'auto' else '직접 입력'})")
             st.caption(f"레이저 발사 {res.onset_s:.2f}s → 분석 구간 {res.win_start_s:.2f}–{res.win_end_s:.2f}s · "
-                       f"{res.fps:.1f} fps · 축척 가로 {res.px_per_mm_x:.3f} / 세로 {res.px_per_mm_y:.3f} px/mm ({res.scale_source}, 선 길이 {res.line_len_px} px) · 검출률 {res.detect_rate * 100:.0f}%")
+                       f"{res.fps:.1f} fps · 축척 {res.px_per_mm_x:.3f} px/mm ({res.scale_source}, 두 점 거리 {res.dot_dist_px} px) · 검출률 {res.detect_rate * 100:.0f}%")
         show(fig_signals(res))
 
 # ---- 내보내기 ----
@@ -317,7 +316,7 @@ st.subheader("결과 내보내기")
 meta = {"name": name, "trial": trial}
 df = summary_rows(results, meta, verdict)
 st.dataframe(df[["조건", "peak_freq_hz", "peak_prominence_db", "peak_rms_mm", "peak_rms_mrad",
-                 "tremor_rms_mm", "tremor_rms_mrad", "drift_rms_mm", "ellipse95_area_mm2", "drop_mm", "height_used_cm", "elev_angle_deg", "px_per_mm_x", "px_per_mm_y", "onset_s"]],
+                 "tremor_rms_mm", "tremor_rms_mrad", "drift_rms_mm", "ellipse95_area_mm2", "drop_mm", "height_used_cm", "elev_angle_deg", "px_per_mm_x", "dot_dist_px", "onset_s"]],
              hide_index=True)
 fname = f"wall_{name or 'subject'}_{trial}".replace(" ", "_")
 d1, d2 = st.columns(2)

@@ -1,16 +1,16 @@
 """
 [벽 실험용] 레이저 포인터 손떨림 분석 모듈 — wall_tremor.py
-모눈종이 대신 벽에 그은 10 cm 가로선·세로선으로 길이 축척을 정한다.
+모눈종이 대신 벽에 붙인 흰 종이 위의 검은 점 2개(중심 간격 10 cm)로 길이 축척을 정한다.
 
 처리 순서
   1) 프레임별 레이저 점 검출 (R-G 차이 + 밝기) -> 서브픽셀 중심
   2) 레이저 '발사 시점' = 측정 화면에서 레이저가 연속 MIN_RUN 프레임 이상 검출되기 시작한 프레임
   3) 분석 구간 = 발사 + start_offset_s  ~  + window_s
   4) 배경(레이저 제거) 영상 = 분석 구간 프레임들의 중앙값
-       -> 검은 가로선·세로선 검출, 각 선의 픽셀 길이 측정
-  5) 가로 축척(px/mm) = 가로선 길이 / 실제 길이, 세로 축척 = 세로선 길이 / 실제 길이
-     (가로·세로를 따로 재므로 카메라가 약간 비스듬해도 보정됨)
-     두 선이 교차하면 교차점을 조준 기준점으로 사용
+       -> 흰 종이(밝고 채도 낮은 사각형) 영역을 먼저 찾고, 그 안에서만 검고 둥근 점 2개 검출
+          (벽의 얼룩·이음매·그림자 등 다른 곳을 기준으로 잘못 읽는 문제 방지)
+       -> 점 중심은 어두운 정도 가중 평균(서브픽셀)
+  5) 축척(px/mm) = 두 점 중심 거리(px) / 실제 간격(mm)
   6) mm -> mrad (촬영 거리·높이 차) / 특징값: 떨림 RMS, 주파수 피크, 조준 오차 등
 """
 from __future__ import annotations
@@ -71,66 +71,99 @@ def find_onset(present: np.ndarray, min_run: int = MIN_RUN) -> int | None:
 
 
 # --------------------------------------------------------------------------------------
-# 2. 배경 분석: 10 cm 가로선·세로선 검출
+# 2. 배경 분석: 흰 종이 위의 검은 점 2개 (중심 간격 = 기준 길이)
 # --------------------------------------------------------------------------------------
-LINE_KERNEL = 41          # 이보다 짧은 획은 선으로 보지 않음 (검출 해상도 px)
-
-
-def _segments(mask: np.ndarray, horizontal: bool):
-    """선 마스크에서 선분 후보 [(길이, 두께, p1, p2, 중심, 어두운정도)] 반환. 주축(PCA) 방향 끝점 사이 길이."""
+def find_white_papers(bg_bgr: np.ndarray):
+    """벽보다 확연히 밝고 채도가 낮은 사각형 영역(흰 종이) 후보 마스크 목록 (큰 것부터)."""
+    H, W = bg_bgr.shape[:2]
+    hsv = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2HSV)
+    S, V = hsv[..., 1].astype(np.int16), hsv[..., 2].astype(np.int16)
+    wall_v = np.median(V)
+    thr = max(wall_v + 20, np.percentile(V, 90) - 25)
+    m = ((V >= thr) & (S < 70)).astype(np.uint8) * 255
+    # 종이 안의 검은 점·글씨는 구멍으로 남으므로 닫힘 연산 + 구멍 메우기
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
-    num, lab, stats, _ = cv2.connectedComponentsWithStats(mask)
-    for i in range(1, num):
-        a = stats[i, cv2.CC_STAT_AREA]
-        if a < 3 * LINE_KERNEL:
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 0.002 * H * W:
             continue
-        ys, xs = np.nonzero(lab == i)
-        pts = np.column_stack([xs, ys]).astype(np.float64)
-        c = pts.mean(0)
-        u = np.linalg.svd(pts - c, full_matrices=False)[2][0]     # 주축 방향
-        if (abs(u[0]) < 0.94) if horizontal else (abs(u[1]) < 0.94):   # 약 ±20° 이내만
+        (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
+        if rw * rh <= 0 or area / (rw * rh) < 0.7:          # 사각형에 가까운 것만
             continue
-        proj = (pts - c) @ u
-        L_ext = float(proj.max() - proj.min() + 1)      # 잉크 끝에서 끝까지
-        thick = a / L_ext
-        if L_ext < 6 * thick:
+        mask = np.zeros((H, W), np.uint8)
+        cv2.drawContours(mask, [c], -1, 255, -1)           # 내부를 꽉 채움 (점 구멍 포함)
+        out.append(dict(mask=mask > 0, contour=c, area=area))
+    return sorted(out, key=lambda d: -d["area"])
+
+
+def _dot_candidates(gray: np.ndarray, region: np.ndarray, strict: bool):
+    """region 안의 검고 둥근 점 후보. 중심은 '어두운 정도' 가중 평균으로 서브픽셀 계산."""
+    inner = cv2.erode(region.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+    if inner.sum() < 100:
+        return []
+    ref_v = float(np.median(gray[inner]))                   # 종이(또는 주변) 밝기
+    dark = ((gray < ref_v * 0.55) & inner).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    cnts, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = []
+    amax = 0.08 * inner.sum()
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < (40 if strict else 25) or area > amax:
             continue
-        # 펜 중심을 0과 10 cm 눈금에 맞춰 그으면 잉크가 양 끝에서 두께/2씩 더 나감 -> 두께만큼 뺌
-        L = L_ext - thick
-        out.append(dict(length=L, thick=float(thick), p1=c + u * proj.min(), p2=c + u * proj.max(), center=c))
+        per = cv2.arcLength(c, True)
+        circ = 4 * np.pi * area / (per * per + 1e-9)        # 원 = 1
+        x, y, w, h = cv2.boundingRect(c)
+        if circ < (0.7 if strict else 0.6) or not (0.6 < w / h < 1.6):
+            continue
+        pad = max(2, int(0.3 * max(w, h)))
+        x0, y0 = max(x - pad, 0), max(y - pad, 0)
+        x1, y1 = min(x + w + pad, gray.shape[1]), min(y + h + pad, gray.shape[0])
+        wgt = np.clip(ref_v - gray[y0:y1, x0:x1].astype(np.float64), 0, None)
+        wgt[wgt < 0.3 * (ref_v - gray[y0:y1, x0:x1].min())] = 0
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        sw = wgt.sum()
+        if sw <= 0:
+            continue
+        ctr = np.array([(wgt * xx).sum() / sw, (wgt * yy).sum() / sw])
+        darkness = float(ref_v - np.median(gray[y:y + h, x:x + w][dark[y:y + h, x:x + w] > 0]))
+        out.append(dict(center=ctr, area=area, circ=circ, dark=darkness, d=np.sqrt(4 * area / np.pi)))
     return out
 
 
-def _dist_to_seg(p, a, b):
-    ab = b - a
-    t = np.clip(np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-9), 0, 1)
-    return float(np.hypot(*(p - (a + t * ab))))
+def _best_pair(cands):
+    """크기가 비슷하고 가장 둥글고 진한 두 점."""
+    best = None
+    for i in range(len(cands)):
+        for j in range(i + 1, len(cands)):
+            a, b = cands[i], cands[j]
+            r = max(a["area"], b["area"]) / min(a["area"], b["area"])
+            if r > 1.8:
+                continue
+            dist = float(np.hypot(*(a["center"] - b["center"])))
+            if dist < 3 * max(a["d"], b["d"]):               # 서로 붙어 있으면 제외
+                continue
+            score = (a["circ"] + b["circ"]) + 0.01 * min(a["dark"], b["dark"]) - 0.5 * (r - 1)
+            if best is None or score > best[0]:
+                best = (score, a, b, dist)
+    return None if best is None else dict(p1=best[1]["center"], p2=best[2]["center"], dist=best[3],
+                                          dot_d=(best[1]["d"] + best[2]["d"]) / 2)
 
 
-def find_scale_lines(gray: np.ndarray, near_xy):
-    """벽의 검은 가로선·세로선을 찾는다. 레이저 위치에 가장 가까운 선을 각각 선택.
-    반환: dict(h=선분 or None, v=선분 or None, cross=교차점 or None)"""
-    bgl = cv2.medianBlur(gray, 61)                          # 국소 벽 밝기
-    diff = bgl.astype(np.int16) - gray.astype(np.int16)
-    dark = (diff > 45).astype(np.uint8) * 255
-    hmask = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (LINE_KERNEL, 1)))
-    vmask = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, LINE_KERNEL)))
-    near = np.asarray(near_xy, float)
-    res = {}
-    for key, m, hz in (("h", hmask, True), ("v", vmask, False)):
-        segs = _segments(m, hz)
-        res[key] = min(segs, key=lambda s_: _dist_to_seg(near, s_["p1"], s_["p2"])) if segs else None
-    res["cross"] = None
-    if res["h"] and res["v"]:
-        h, v = res["h"], res["v"]
-        # 두 직선의 교점
-        d1, d2 = h["p2"] - h["p1"], v["p2"] - v["p1"]
-        A = np.array([d1, -d2]).T
-        if abs(np.linalg.det(A)) > 1e-6:
-            t1, t2 = np.linalg.solve(A, v["p1"] - h["p1"])
-            if -0.02 <= t1 <= 1.02 and -0.02 <= t2 <= 1.02:     # 두 선분이 실제로 교차할 때만
-                res["cross"] = h["p1"] + t1 * d1
-    return res
+def find_dot_pair(bg_bgr: np.ndarray, gray: np.ndarray):
+    """1순위: 흰 종이 안에서 검은 점 2개. 2순위(종이를 못 찾은 경우): 화면 전체에서 엄격한 기준으로."""
+    for paper in find_white_papers(bg_bgr):
+        pair = _best_pair(_dot_candidates(gray, paper["mask"], strict=False))
+        if pair:
+            pair.update(paper_contour=paper["contour"], source="paper")
+            return pair
+    H, W = gray.shape
+    pair = _best_pair(_dot_candidates(gray, np.ones((H, W), bool), strict=True))
+    if pair:
+        pair.update(paper_contour=None, source="whole")
+    return pair
 
 
 # --------------------------------------------------------------------------------------
@@ -145,10 +178,10 @@ class TremorResult:
     win_end_s: float
     px_per_mm_x: float                    # 가로 축척 (원본 영상 px/mm)
     px_per_mm_y: float                    # 세로 축척
-    scale_source: str                     # 'lines' | 'manual'
-    line_len_px: tuple | None             # (가로선, 세로선) 픽셀 길이 (원본 해상도)
+    scale_source: str                     # 'dots' | 'manual'
+    dot_dist_px: float | None             # 두 점 중심 사이 거리 (원본 해상도 px)
     ref_px: tuple | None
-    ref_source: str                       # 'cross'(선 교차점) | 'mean'
+    ref_source: str                       # 'mean'(레이저 평균 위치)
     detect_rate: float                    # 분석 구간 내 레이저 검출 비율
     # 특징값
     tremor_rms_mm: float
@@ -283,8 +316,8 @@ def find_onset_scene(pts, scene, min_run=MIN_RUN, scene_thr=SCENE_THR):
 
 def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
                   distance_cm: float | None = None, height_cm: float = 0.0, height_mode: str = "auto",
-                  line_h_mm: float = 100.0, line_v_mm: float = 100.0,
-                  scale_mode: str = "lines", manual_ppm_x: float | None = None, manual_ppm_y: float | None = None,
+                  dot_mm: float = 100.0,
+                  scale_mode: str = "dots", manual_ppm_x: float | None = None, manual_ppm_y: float | None = None,
                   onset_override_s: float | None = None, progress_cb=None,
                   scan: dict | None = None) -> TremorResult:
     scan = scan or scan_video(path, progress_cb)
@@ -350,40 +383,24 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
     del stack
     gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
     laser_c = seg.mean(0)
-    lines = None
-    ref = None
+    pair = None
     if scale_mode == "manual":
         if not (manual_ppm_x and manual_ppm_y):
             raise RuntimeError("직접 입력 모드: 가로·세로 px/mm 값을 입력하세요.")
         ppm_x, ppm_y = manual_ppm_x * scale, manual_ppm_y * scale     # 원본 해상도 입력 -> 검출 해상도
     else:
-        lines = find_scale_lines(gray, laser_c)
-        h, v = lines["h"], lines["v"]
-        if h is None and v is None:
-            raise RuntimeError("벽의 가로선·세로선을 찾지 못했습니다. 진한 검은 선이 화면에 잘 보이는지 확인하거나 "
-                               "'직접 입력' 모드를 쓰세요.")
-        ppm_x = h["length"] / line_h_mm if h else None
-        ppm_y = v["length"] / line_v_mm if v else None
-        if ppm_x is None:
-            ppm_x = ppm_y
-            warnings.append("가로선을 찾지 못해 세로선 축척을 가로에도 적용했습니다.")
-        if ppm_y is None:
-            ppm_y = ppm_x
-            warnings.append("세로선을 찾지 못해 가로선 축척을 세로에도 적용했습니다.")
-        if h and v and abs(ppm_x / ppm_y - 1) > 0.05:
-            warnings.append(f"가로·세로 축척 차이가 {abs(ppm_x / ppm_y - 1) * 100:.1f}% 입니다. "
-                            "카메라가 벽에 비스듬하거나 선 길이가 다를 수 있습니다.")
-        for nm, sg in (("가로선", h), ("세로선", v)):
-            if sg and sg["length"] < 150:
-                warnings.append(f"{nm}이 {sg['length'] / scale:.0f} px로 짧아 축척 오차가 클 수 있습니다.")
-        if lines["cross"] is not None:
-            ref = lines["cross"]
-    if ref is None:
-        ref_source = "mean"
-        ref_xy = laser_c
-    else:
-        ref_source = "cross"
-        ref_xy = np.array(ref)
+        pair = find_dot_pair(bg, gray)
+        if pair is None:
+            raise RuntimeError("흰 종이 위의 검은 점 2개를 찾지 못했습니다. 종이와 두 점이 화면에 선명하게 보이는지 "
+                               "확인하거나 '직접 입력' 모드를 쓰세요.")
+        ppm_x = ppm_y = pair["dist"] / dot_mm
+        if pair["source"] == "whole":
+            warnings.append("흰 종이 영역을 찾지 못해 화면 전체에서 점을 찾았습니다. 결과 이미지에서 두 점이 맞는지 확인하세요.")
+        if pair["dist"] < 150:
+            warnings.append(f"두 점 사이가 {pair['dist'] / scale:.0f} px로 짧아 축척 오차가 클 수 있습니다 "
+                            "(카메라를 가까이 하거나 간격을 넓히세요).")
+    ref_source = "mean"
+    ref_xy = laser_c
 
     t = (np.arange(win0, win1) - onset) / fps
     x = (seg[:, 0] - ref_xy[0]) / ppm_x
@@ -406,16 +423,17 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
 
     # ---- 미리보기 이미지 (배경 + 검출된 선 + 궤적 + 기준점) ----
     prev = bg.copy()
-    if lines is not None:
-        for key, col in (("h", (255, 0, 255)), ("v", (255, 160, 0))):
-            sg = lines[key]
-            if sg:
-                p1, p2 = tuple(np.round(sg["p1"]).astype(int)), tuple(np.round(sg["p2"]).astype(int))
-                cv2.line(prev, p1, p2, col, 3, cv2.LINE_AA)
-                for p in (p1, p2):
-                    cv2.circle(prev, p, 8, col, 2, cv2.LINE_AA)
+    if pair is not None:
+        if pair["paper_contour"] is not None:
+            cv2.drawContours(prev, [pair["paper_contour"]], -1, (255, 200, 0), 2)
+        p1, p2 = tuple(np.round(pair["p1"]).astype(int)), tuple(np.round(pair["p2"]).astype(int))
+        cv2.line(prev, p1, p2, (255, 0, 255), 1, cv2.LINE_AA)
+        r = int(max(10, pair["dot_d"]))
+        for p in (p1, p2):
+            cv2.circle(prev, p, r, (255, 0, 255), 2, cv2.LINE_AA)
+            cv2.drawMarker(prev, p, (255, 0, 255), cv2.MARKER_CROSS, 8, 1)
     cv2.polylines(prev, [np.round(seg).astype(np.int32).reshape(-1, 1, 2)], False, (0, 0, 255), 1, cv2.LINE_AA)
-    col = (0, 200, 0) if ref_source == "cross" else (0, 140, 255)
+    col = (0, 140, 255)
     cv2.drawMarker(prev, (int(ref_xy[0]), int(ref_xy[1])), col, cv2.MARKER_CROSS, 40, 2)
     if desc is not None:
         p0 = (int(desc["init_xy"][0]), int(desc["init_xy"][1]))
@@ -425,16 +443,13 @@ def analyze_video(path: str, window_s: float = 7.0, start_offset_s: float = 1.0,
         cv2.putText(prev, f"drop {drop_mm:.0f} mm", (p0[0] + 12, (p0[1] + p1[1]) // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-    ll = None
-    if lines is not None:
-        ll = tuple(round(lines[k]["length"] / scale, 1) if lines[k] else None for k in ("h", "v"))
     return TremorResult(
         fps=float(fps), n_frames=n, onset_s=onset / fps,
         win_start_s=win0 / fps, win_end_s=win1 / fps,
         px_per_mm_x=float(ppm_x / scale), px_per_mm_y=float(ppm_y / scale), scale_source=scale_mode,
-        line_len_px=ll, ref_px=tuple((ref_xy / scale).round(1).tolist()),
+        dot_dist_px=(round(pair["dist"] / scale, 1) if pair else None), ref_px=tuple((ref_xy / scale).round(1).tolist()),
         ref_source=ref_source, detect_rate=det_rate,
-        mean_offset_mm=(float(x.mean()), float(y.mean())) if ref_source == "cross" else None,
+        mean_offset_mm=None,
         descent=desc is not None, move_s=(desc["move_idx"] / fps) if desc else None,
         arrive_s=(desc["arrive_idx"] / fps) if desc else None, drop_mm=drop_mm,
         height_used_cm=float(h_used), height_source=h_src, elev_angle_deg=elev, slant_cm=slant,
